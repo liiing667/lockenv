@@ -858,17 +858,20 @@ func (l *LockEnv) ChangePassword(currentPassword, newPassword []byte) error {
 	if err != nil {
 		return ErrNotInitialized
 	}
-	defer db.Close()
 	l.db = db
 
 	// Read metadata with current password
 	metadata, currentEnc, err := l.readMetadata(currentPassword)
 	if err != nil {
+		db.Close()
+		l.db = nil
 		return err
 	}
 	defer currentEnc.Destroy()
 
-	// Read all file data with current password
+	// Read and decrypt all file data with the current password.
+	// The original database is only read here; it stays untouched until
+	// the re-encrypted replacement is fully written to a temporary copy.
 	type fileData struct {
 		path string
 		data []byte
@@ -884,11 +887,15 @@ func (l *LockEnv) ChangePassword(currentPassword, newPassword []byte) error {
 	for _, entry := range metadata.Files {
 		encData, err := db.GetFileData(entry.Path)
 		if err != nil {
+			db.Close()
+			l.db = nil
 			return fmt.Errorf("file %s not sealed in vault: %w", entry.Path, err)
 		}
 
 		data, err := currentEnc.Decrypt(encData)
 		if err != nil {
+			db.Close()
+			l.db = nil
 			return fmt.Errorf("failed to decrypt file %s: %w", entry.Path, err)
 		}
 		files = append(files, fileData{path: entry.Path, data: data})
@@ -897,6 +904,8 @@ func (l *LockEnv) ChangePassword(currentPassword, newPassword []byte) error {
 	// Create new KDF with new password
 	newKDF, err := crypto.NewKDF()
 	if err != nil {
+		db.Close()
+		l.db = nil
 		return fmt.Errorf("failed to create new KDF: %w", err)
 	}
 
@@ -906,50 +915,134 @@ func (l *LockEnv) ChangePassword(currentPassword, newPassword []byte) error {
 	newEnc := crypto.NewEncryptor(newKey)
 	defer newEnc.Destroy()
 
-	// Update salt and iterations
-	if err := db.SetSalt(newKDF.Salt); err != nil {
-		return fmt.Errorf("failed to update salt: %w", err)
+	// Re-encrypt everything in memory first. No disk writes happen until
+	// every piece is ready, so a failure here leaves the vault untouched.
+	type encFileData struct {
+		path string
+		data []byte
 	}
-	if err := db.SetIterations(uint32(newKDF.Iterations)); err != nil {
-		return fmt.Errorf("failed to update iterations: %w", err)
-	}
+	encFiles := make([]encFileData, 0, len(files))
+	defer func() {
+		for i := range encFiles {
+			crypto.ClearBytes(encFiles[i].data)
+		}
+	}()
 
-	// Re-encrypt all files with new key
-	for _, file := range files {
-		encData, err := newEnc.Encrypt(file.data)
+	for i := range files {
+		encData, err := newEnc.Encrypt(files[i].data)
 		if err != nil {
-			return fmt.Errorf("failed to re-encrypt file %s: %w", file.path, err)
+			db.Close()
+			l.db = nil
+			return fmt.Errorf("failed to re-encrypt file %s: %w", files[i].path, err)
 		}
-		if err := db.StoreFileData(file.path, encData); err != nil {
-			return fmt.Errorf("failed to store re-encrypted file %s: %w", file.path, err)
-		}
-		// Clear file data from memory
-		crypto.ClearBytes(file.data)
+		encFiles = append(encFiles, encFileData{path: files[i].path, data: encData})
+		// Clear plaintext as soon as it is re-encrypted
+		crypto.ClearBytes(files[i].data)
+		files[i].data = nil
 	}
 
 	// Re-encrypt checksum
 	checksum := sha256.Sum256([]byte(passwordCheckString))
 	checksumData, err := newEnc.Encrypt([]byte(hex.EncodeToString(checksum[:])))
 	if err != nil {
+		db.Close()
+		l.db = nil
 		return fmt.Errorf("failed to encrypt checksum: %w", err)
-	}
-	if err := db.StoreMetadataBytes("checksum", checksumData); err != nil {
-		return fmt.Errorf("failed to store checksum: %w", err)
 	}
 
 	// Re-encrypt metadata
 	metadataJSON, err := json.Marshal(metadata)
 	if err != nil {
+		db.Close()
+		l.db = nil
 		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
 	encryptedMetadata, err := newEnc.Encrypt(metadataJSON)
 	if err != nil {
+		db.Close()
+		l.db = nil
 		return fmt.Errorf("failed to encrypt metadata: %w", err)
 	}
-	if err := db.StoreMetadataBytes("files", encryptedMetadata); err != nil {
-		return fmt.Errorf("failed to store metadata: %w", err)
+
+	// Write the re-encrypted vault to a temporary copy in the same
+	// directory (same filesystem, required for the atomic rename below).
+	// The copy contains only encrypted data and is created with 0600.
+	tmpPath := l.path + ".tmp"
+	backupPath := l.path + ".backup"
+	os.Remove(tmpPath)
+	os.Remove(backupPath)
+
+	committed := false
+	defer func() {
+		if !committed {
+			os.Remove(tmpPath)
+		}
+	}()
+
+	if err := db.Snapshot(tmpPath); err != nil {
+		db.Close()
+		l.db = nil
+		return fmt.Errorf("failed to create temporary vault copy: %w", err)
 	}
 
+	// Apply the re-encrypted data to the temporary copy only
+	tmpDB, err := storage.Open(tmpPath)
+	if err != nil {
+		db.Close()
+		l.db = nil
+		return fmt.Errorf("failed to open temporary vault copy: %w", err)
+	}
+
+	err = func() error {
+		if err := tmpDB.SetSalt(newKDF.Salt); err != nil {
+			return fmt.Errorf("failed to update salt: %w", err)
+		}
+		if err := tmpDB.SetIterations(uint32(newKDF.Iterations)); err != nil {
+			return fmt.Errorf("failed to update iterations: %w", err)
+		}
+		for _, file := range encFiles {
+			if err := tmpDB.StoreFileData(file.path, file.data); err != nil {
+				return fmt.Errorf("failed to store re-encrypted file %s: %w", file.path, err)
+			}
+		}
+		if err := tmpDB.StoreMetadataBytes("checksum", checksumData); err != nil {
+			return fmt.Errorf("failed to store checksum: %w", err)
+		}
+		if err := tmpDB.StoreMetadataBytes("files", encryptedMetadata); err != nil {
+			return fmt.Errorf("failed to store metadata: %w", err)
+		}
+		return nil
+	}()
+
+	if closeErr := tmpDB.Close(); err == nil && closeErr != nil {
+		err = fmt.Errorf("failed to close temporary vault copy: %w", closeErr)
+	}
+	if err != nil {
+		db.Close()
+		l.db = nil
+		return err
+	}
+
+	// The replacement vault is complete on disk. Close the original and
+	// atomically swap the files, keeping a backup for rollback.
+	if err := db.Close(); err != nil {
+		return fmt.Errorf("failed to close vault: %w", err)
+	}
+	l.db = nil
+
+	if err := os.Rename(l.path, backupPath); err != nil {
+		return fmt.Errorf("failed to back up original vault: %w", err)
+	}
+	if err := os.Rename(tmpPath, l.path); err != nil {
+		// Roll back so the original password keeps working
+		_ = os.Rename(backupPath, l.path)
+		return fmt.Errorf("failed to replace vault: %w", err)
+	}
+	if err := os.Remove(backupPath); err != nil {
+		fmt.Printf("warning: failed to remove vault backup: %v\n", err)
+	}
+
+	committed = true
 	return nil
 }
 

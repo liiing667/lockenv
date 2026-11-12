@@ -457,6 +457,139 @@ func TestChangePassword(t *testing.T) {
 	}
 }
 
+func TestChangePassword_RollbackOnWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	lockenv, err := New(dir)
+	if err != nil {
+		t.Fatalf("Failed to create LockEnv: %v", err)
+	}
+	defer lockenv.Close()
+
+	oldPassword := []byte("oldpass")
+	newPassword := []byte("newpass")
+
+	if err := lockenv.Init(oldPassword); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	// Create and seal two test files
+	testFiles := map[string][]byte{
+		"one.txt": []byte("secret one"),
+		"two.txt": []byte("secret two"),
+	}
+	for name, content := range testFiles {
+		if err := os.WriteFile(filepath.Join(dir, name), content, 0644); err != nil {
+			t.Fatalf("Failed to create test file: %v", err)
+		}
+	}
+	paths := []string{filepath.Join(dir, "one.txt"), filepath.Join(dir, "two.txt")}
+	if err := lockenv.LockFiles(context.Background(), paths, oldPassword); err != nil {
+		t.Fatalf("Track failed: %v", err)
+	}
+	if err := lockenv.FinalizeLock(context.Background(), oldPassword, true); err != nil {
+		t.Fatalf("Seal failed: %v", err)
+	}
+
+	// Force the temporary copy to fail by placing a directory at its path
+	tmpPath := filepath.Join(dir, LockEnvFile+".tmp")
+	if err := os.Mkdir(tmpPath, 0755); err != nil {
+		t.Fatalf("Failed to create blocking directory: %v", err)
+	}
+	// Keep the directory non-empty so it cannot be removed as stale state
+	if err := os.WriteFile(filepath.Join(tmpPath, "block"), []byte("x"), 0644); err != nil {
+		t.Fatalf("Failed to populate blocking directory: %v", err)
+	}
+
+	// Change password must fail
+	if err := lockenv.ChangePassword(oldPassword, newPassword); err == nil {
+		t.Fatal("Expected ChangePassword to fail, got nil error")
+	}
+
+	if err := os.RemoveAll(tmpPath); err != nil {
+		t.Fatalf("Failed to remove blocking directory: %v", err)
+	}
+
+	// No temporary or backup files may be left behind
+	for _, suffix := range []string{".tmp", ".backup"} {
+		if _, err := os.Stat(filepath.Join(dir, LockEnvFile+suffix)); !os.IsNotExist(err) {
+			t.Errorf("Leftover file %s%s after failed ChangePassword", LockEnvFile, suffix)
+		}
+	}
+
+	// Old password must still fully decrypt the vault
+	result, err := lockenv.Unlock(context.Background(), oldPassword, StrategyUseVault, nil)
+	if err != nil {
+		t.Fatalf("Unlock with old password failed after rollback: %v", err)
+	}
+	if len(result.Errors) != 0 {
+		t.Fatalf("Unlock reported errors after rollback: %v", result.Errors)
+	}
+	if len(result.Extracted) != len(testFiles) {
+		t.Errorf("Expected %d extracted files, got %d", len(testFiles), len(result.Extracted))
+	}
+	for name, want := range testFiles {
+		content, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("Failed to read unsealed file: %v", err)
+		}
+		if string(content) != string(want) {
+			t.Errorf("Content mismatch for %s: got %s, want %s", name, content, want)
+		}
+	}
+
+	// New password must not work
+	if err := lockenv.VerifyPassword(newPassword); err != ErrWrongPassword {
+		t.Errorf("Expected ErrWrongPassword for new password after rollback, got %v", err)
+	}
+}
+
+func TestChangePassword_NoLeftoverFiles(t *testing.T) {
+	dir := t.TempDir()
+	lockenv, err := New(dir)
+	if err != nil {
+		t.Fatalf("Failed to create LockEnv: %v", err)
+	}
+	defer lockenv.Close()
+
+	oldPassword := []byte("oldpass")
+	newPassword := []byte("newpass")
+
+	if err := lockenv.Init(oldPassword); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	testFile := filepath.Join(dir, "test.txt")
+	if err := os.WriteFile(testFile, []byte("secret"), 0644); err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+	if err := lockenv.LockFiles(context.Background(), []string{testFile}, oldPassword); err != nil {
+		t.Fatalf("Track failed: %v", err)
+	}
+	if err := lockenv.FinalizeLock(context.Background(), oldPassword, true); err != nil {
+		t.Fatalf("Seal failed: %v", err)
+	}
+
+	if err := lockenv.ChangePassword(oldPassword, newPassword); err != nil {
+		t.Fatalf("Change password failed: %v", err)
+	}
+
+	// Successful rotation must not leave temporary or backup files
+	for _, suffix := range []string{".tmp", ".backup"} {
+		if _, err := os.Stat(filepath.Join(dir, LockEnvFile+suffix)); !os.IsNotExist(err) {
+			t.Errorf("Leftover file %s%s after successful ChangePassword", LockEnvFile, suffix)
+		}
+	}
+
+	// Vault file must keep restrictive permissions
+	info, err := os.Stat(filepath.Join(dir, LockEnvFile))
+	if err != nil {
+		t.Fatalf("Failed to stat vault: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0600 {
+		t.Errorf("Vault permissions = %o, want 600", perm)
+	}
+}
+
 // Security Tests - Path Traversal Prevention
 
 func TestTrack_RejectsPathTraversal(t *testing.T) {

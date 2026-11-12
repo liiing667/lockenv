@@ -50,6 +50,34 @@ func (s *Storage) Close() error {
 	return s.db.Close()
 }
 
+// Snapshot writes a consistent copy of the database to the given path.
+// The destination file is created with 0600 permissions and synced to disk
+// before returning. The snapshot contains only encrypted data.
+func (s *Storage) Snapshot(path string) error {
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.CopyFile(path, 0600)
+	}); err != nil {
+		return fmt.Errorf("failed to snapshot database: %w", err)
+	}
+
+	// Ensure restrictive permissions even if a stale file was reused
+	if err := os.Chmod(path, 0600); err != nil {
+		return fmt.Errorf("failed to set snapshot permissions: %w", err)
+	}
+
+	// Sync the snapshot to disk so it survives a crash
+	f, err := os.OpenFile(path, os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to open snapshot for sync: %w", err)
+	}
+	defer f.Close()
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("failed to sync snapshot: %w", err)
+	}
+
+	return nil
+}
+
 // Initialize creates the bucket structure for a new lockenv
 func (s *Storage) Initialize() error {
 	return s.db.Update(func(tx *bolt.Tx) error {
